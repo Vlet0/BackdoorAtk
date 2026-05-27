@@ -119,6 +119,34 @@ def train_worker(rank, world_size, args, config):
     methods = ["Clean", "FTrojan", "SIG", "WaNet"]
     
     for method in methods:
+        checkpoint_dir = f"output/model/{method.lower()}"
+        last_ckpt = os.path.join(checkpoint_dir, "last.pth")
+
+        # ── Skip methods that are already fully trained ────────────────────────
+        if args.skip_completed and os.path.isfile(last_ckpt):
+            try:
+                _ckpt = torch.load(last_ckpt, map_location="cpu", weights_only=False)
+                saved_epoch = _ckpt.get("epoch", 0)
+                total_epochs = config["train"]["epochs"]
+                if saved_epoch >= total_epochs:
+                    if rank == 0:
+                        print(f"[SKIP] {method} already complete ({saved_epoch}/{total_epochs} epochs). Skipping training.")
+                    # Still copy checkpoints so eval phase works
+                    if rank == 0:
+                        for tag in ["best", "last"]:
+                            src = os.path.join(checkpoint_dir, f"{tag}.pth")
+                            dst = f"output/checkpoints/{method.lower()}_{tag}.pth"
+                            if os.path.isfile(src) and not os.path.isfile(dst):
+                                shutil.copy(src, dst)
+                    continue
+                else:
+                    if rank == 0:
+                        print(f"[RESUME] {method} interrupted at epoch {saved_epoch}/{total_epochs}. Resuming...")
+            except Exception as exc:
+                if rank == 0:
+                    print(f"[WARN] Cannot read checkpoint for {method}: {exc}. Retraining from scratch.")
+        # ──────────────────────────────────────────────────────────────────────
+
         if rank == 0: logger.info(f"==================== DDP Training: {method} ====================")
         poison_rate = config["train"]["poison_rate"] if method != "Clean" else 0.0
         trigger_fn = trigger_functions[method.lower()]
@@ -157,12 +185,16 @@ def train_worker(rank, world_size, args, config):
             model = DDP(model, device_ids=[rank], output_device=rank)
             
         trainer = RegressionTrainer(model, train_ds, val_ds, config, device, is_ddp=is_ddp, rank=rank)
-        checkpoint_dir = f"output/model/{method.lower()}"
-        trainer.train(checkpoint_dir)
+        trainer.train(checkpoint_dir, resume=args.resume)
         
         if rank == 0:
-            shutil.copy(f"{checkpoint_dir}/best.pth", f"output/checkpoints/{method.lower()}_best.pth")
-            shutil.copy(f"{checkpoint_dir}/last.pth", f"output/checkpoints/{method.lower()}_last.pth")
+            # Only copy checkpoints if the files exist
+            best_src = f"{checkpoint_dir}/best.pth"
+            last_src = f"{checkpoint_dir}/last.pth"
+            if os.path.isfile(best_src):
+                shutil.copy(best_src, f"output/checkpoints/{method.lower()}_best.pth")
+            if os.path.isfile(last_src):
+                shutil.copy(last_src, f"output/checkpoints/{method.lower()}_last.pth")
             
     if is_ddp:
         ddp_cleanup()
@@ -276,6 +308,10 @@ def main():
     parser.add_argument("--compile", type=str_to_bool, default=True, help="Enable torch.compile for speed")
     parser.add_argument("--num_workers", type=int, default=16, help="DataLoader workers (default: 16)")
     parser.add_argument("--precision", type=str, default="16-mixed", help="Mixed precision mode")
+    parser.add_argument("--resume", type=str_to_bool, default=True,
+                        help="Resume training from last checkpoint if interrupted (default: True)")
+    parser.add_argument("--skip_completed", type=str_to_bool, default=True,
+                        help="Skip methods that have already finished all epochs (default: True)")
     args = parser.parse_args()
     
     # Restrict visible devices strictly to requested ids to prevent using idle unwanted GPUs

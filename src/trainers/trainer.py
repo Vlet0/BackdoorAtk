@@ -43,12 +43,37 @@ class RegressionTrainer:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.epochs)
         return optimizer, scheduler
 
-    def train(self, checkpoint_dir):
+    def train(self, checkpoint_dir, resume=True):
         if self.rank == 0:
             os.makedirs(checkpoint_dir, exist_ok=True)
             
         best_val_loss = float('inf')
-        
+        start_epoch = 1
+
+        # ── Resume from last checkpoint if available ──────────────────────────
+        last_ckpt_path = os.path.join(checkpoint_dir, "last.pth")
+        if resume and os.path.isfile(last_ckpt_path):
+            if self.rank == 0:
+                print(f"[RESUME] Found checkpoint: {last_ckpt_path}")
+            map_loc = self.device
+            ckpt = torch.load(last_ckpt_path, map_location=map_loc, weights_only=False)
+
+            # Strip DDP / compiled model prefix from keys
+            raw_sd = ckpt["model_state_dict"]
+            raw_sd = {k.replace("_orig_mod.", "").replace("module.", ""): v for k, v in raw_sd.items()}
+            model_to_load = self.model.module if hasattr(self.model, "module") else self.model
+            model_to_load.load_state_dict(raw_sd, strict=False)
+
+            self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            best_val_loss = ckpt.get("best_val_loss", ckpt.get("val_loss", float('inf')))
+            start_epoch = ckpt["epoch"] + 1  # resume from NEXT epoch
+
+            if self.rank == 0:
+                print(f"[RESUME] Resuming from epoch {start_epoch}/{self.epochs} "
+                      f"| best_val_loss so far: {best_val_loss:.5f}")
+        # ─────────────────────────────────────────────────────────────────────
+
         # Setup DataLoaders
         train_sampler = DistributedSampler(self.train_dataset, shuffle=True) if self.is_ddp else None
         val_sampler = DistributedSampler(self.val_dataset, shuffle=False) if self.is_ddp else None
@@ -56,7 +81,12 @@ class RegressionTrainer:
         train_loader = self._get_dataloader(self.train_dataset, self.batch_size, shuffle=(train_sampler is None), sampler=train_sampler)
         val_loader = self._get_dataloader(self.val_dataset, self.batch_size, shuffle=False, sampler=val_sampler)
         
-        for epoch in range(1, self.epochs + 1):
+        if start_epoch > self.epochs:
+            if self.rank == 0:
+                print(f"[RESUME] Training already complete ({self.epochs} epochs done). Skipping.")
+            return best_val_loss
+
+        for epoch in range(start_epoch, self.epochs + 1):
             if self.is_ddp:
                 train_sampler.set_epoch(epoch)
                 
@@ -95,12 +125,14 @@ class RegressionTrainer:
                     "optimizer_state_dict": self.optimizer.state_dict(),
                     "scheduler_state_dict": self.scheduler.state_dict(),
                     "val_loss": val_loss,
+                    "best_val_loss": best_val_loss,  # persist best so resume is accurate
                     "config": self.config
                 }
                 
                 torch.save(checkpoint, os.path.join(checkpoint_dir, "last.pth"))
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
+                    checkpoint["best_val_loss"] = best_val_loss
                     torch.save(checkpoint, os.path.join(checkpoint_dir, "best.pth"))
                     
         # Synchronize all processes before returning
